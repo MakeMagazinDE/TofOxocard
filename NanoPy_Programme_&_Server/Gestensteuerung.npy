@@ -1,0 +1,256 @@
+# Gestensteuerung mit ToF-Cartridge (NanoPy)
+# links/rechts wischen = Seite wechseln
+# nach unten wischen = Aktion, nach oben wischen = Reset
+# Joystick Mitte = Programm beenden
+
+
+import tof
+
+const HANDMAX = 350    # Hand erkannt, wenn näher als 35 cm
+const MINZONES = 2     # so viele Zonen müssen die Hand sehen
+const SWIPEMIN = 1.5   # Mindestweg in Zonen für ein Wischen
+const SWIPEMS = 900    # Wischen muss schneller sein (ms)
+const COOLMS = 600     # Pause nach einer Geste (ms)
+const ROTATE = 1       # Drehkorrektur des Rasters: 0, 1 (90° Uhrzeigersinn), 2 (180°), 3 (90° gegen)
+const MIRRORX = 0      # 1 = links/rechts vertauscht
+const MIRRORY = 0      # 1 = oben/unten vertauscht
+const NPAGES = 4
+
+page = 0               # 0 Uhr, 1 Datum, 2 Sensor, 3 Stoppuhr
+handMask:int[16]       # welche Zonen die Hand sehen
+seen = false
+handOn = false
+waitRelease = false
+handX = 0.0
+handY = 0.0
+handD = 0
+startX = 0.0
+startY = 0.0
+handStart:long
+coolUntil:long
+lastGesture = 0        # 1 links, 2 rechts, 3 hoch, 4 runter
+gestureAt:long
+
+swRun = false          # Stoppuhr
+swStart:long
+swAcc:long
+txt:byte[32]
+
+def ct(y:int, s:byte[]):
+    w = textWidth(s)
+    drawText(120 - w / 2, y, s)
+
+# ---------- Hand im 4x4-Raster finden ----------
+def readHand()->bool:
+    TOF.getData()
+    n = 0
+    sx = 0.0
+    sy = 0.0
+    minD = 9999
+    for k in 16:
+        handMask[k] = 0
+    for i in 16:
+        if TOF.status[i] == 5 or TOF.status[i] == 9:
+            d = TOF.data[i]
+            if d < HANDMAX:
+                c0 = i % 4
+                r0 = i / 4
+                c = c0
+                r = r0
+                if ROTATE == 1:            # 90° im Uhrzeigersinn
+                    c = 3 - r0
+                    r = c0
+                if ROTATE == 2:            # 180°
+                    c = 3 - c0
+                    r = 3 - r0
+                if ROTATE == 3:            # 90° gegen den Uhrzeigersinn
+                    c = r0
+                    r = 3 - c0
+                if MIRRORX == 1:
+                    c = 3 - c
+                if MIRRORY == 1:
+                    r = 3 - r
+                handMask[r * 4 + c] = 1
+                sx = sx + c
+                sy = sy + r
+                n = n + 1
+                if d < minD:
+                    minD = d
+    if n < MINZONES:
+        return false
+    handX = sx / n
+    handY = sy / n
+    handD = minD
+    return true
+
+# ---------- Aktionen ----------
+def toggleStopwatch(now:long):
+    if swRun:
+        swAcc = swAcc + (now - swStart)
+        swRun = false
+    else:
+        swStart = now
+        swRun = true
+
+def sendCommand(g:int):
+    # Hier kommt später das Senden an andere Geräte hin (MQTT/HTTP)
+    return
+
+def gesture(g:int, now:long):
+    lastGesture = g
+    gestureAt = now
+    coolUntil = now + COOLMS
+    waitRelease = true
+    if g == 1:
+        page = (page + 1) % NPAGES
+    if g == 2:
+        page = (page + NPAGES - 1) % NPAGES
+    if page == 3:
+        if g == 4:                     # nach unten = Aktion
+            toggleStopwatch(now)
+        if g == 3:                     # nach oben = Reset
+            swRun = false
+            swAcc = 0
+    sendCommand(g)
+
+# ---------- Bewegung verfolgen ----------
+def trackHand(now:long):
+    seen = readHand()
+    if seen == false:
+        if handOn:                     # Hand weg -> war es ein Wischen?
+            handOn = false
+            dur:long = now - handStart
+            if dur < SWIPEMS and now >= coolUntil:
+                dx = handX - startX
+                dy = handY - startY
+                adx = dx
+                if adx < 0.0:
+                    adx = 0.0 - adx
+                ady = dy
+                if ady < 0.0:
+                    ady = 0.0 - ady
+                if adx >= ady and adx >= SWIPEMIN:
+                    if dx < 0.0:
+                        gesture(1, now)    # nach links
+                    else:
+                        gesture(2, now)    # nach rechts
+                else:
+                    if ady >= SWIPEMIN:
+                        if dy < 0.0:
+                            gesture(3, now)    # nach oben
+                        else:
+                            gesture(4, now)    # nach unten
+        waitRelease = false
+        return
+    if waitRelease or now < coolUntil:
+        return
+    if handOn == false:                # Hand neu aufgetaucht
+        handOn = true
+        startX = handX
+        startY = handY
+        handStart = now
+
+# ---------- Anzeige ----------
+def setTime2(a:int, b:int):
+    if a < 10:
+        if b < 10:
+            txt = "0" + a + ":0" + b
+        else:
+            txt = "0" + a + ":" + b
+    else:
+        if b < 10:
+            txt = "" + a + ":0" + b
+        else:
+            txt = "" + a + ":" + b
+
+def drawTitle(now:long):
+    textFont(FONT_ROBOTO_24)
+    if now - gestureAt < 600 and lastGesture > 0:
+        stroke(255, 220, 60)           # kurze Rückmeldung zur Geste
+        if lastGesture == 1:
+            ct(14, "<< weiter")
+        if lastGesture == 2:
+            ct(14, "zurueck >>")
+        if lastGesture == 3:
+            ct(14, "Reset")
+        if lastGesture == 4:
+            ct(14, "Aktion")
+        return
+    stroke(150, 150, 170)
+    if page == 0:
+        ct(14, "Uhrzeit")
+    if page == 1:
+        ct(14, "Datum")
+    if page == 2:
+        if seen:
+            ct(14, "Hand " + handD / 10 + " cm")
+        else:
+            ct(14, "Sensor")
+    if page == 3:
+        ct(14, "Stoppuhr")
+
+def drawDots():
+    noStroke()
+    for p in NPAGES:
+        fill(70, 70, 80)
+        if p == page:
+            fill(220, 220, 220)
+            if seen:
+                fill(60, 220, 90)      # grün = Hand erkannt
+        drawCircle(90 + p * 20, 224, 5)
+
+def drawSensor():
+    noStroke()
+    for r in 4:
+        for c in 4:
+            fill(35, 35, 50)
+            if handMask[r * 4 + c] == 1:
+                fill(200, 60, 60)
+            drawRectangle(48 + c * 36, 52 + r * 36, 34, 34)
+    if seen:
+        fill(255, 255, 255)
+        hx:int = 48.0 + handX * 36.0 + 17.0
+        hy:int = 52.0 + handY * 36.0 + 17.0
+        drawCircle(hx, hy, 6)
+
+def drawPage(now:long):
+    background(0, 0, 0)
+    drawTitle(now)
+    stroke(255, 255, 255)
+    if page == 0:
+        textFont(FONT_ROBOTO_80)
+        setTime2(getHour(), getMinute())
+        ct(70, txt)
+    if page == 1:
+        textFont(FONT_ROBOTO_32)
+        ct(100, "" + getDay() + "." + getMonth() + "." + getYear())
+    if page == 2:
+        drawSensor()
+    if page == 3:
+        el:long = swAcc
+        if swRun:
+            el = swAcc + (now - swStart)
+        sec:long = el / 1000
+        textFont(FONT_ROBOTO_80)
+        setTime2(sec / 60, sec % 60)
+        if swRun:
+            stroke(60, 220, 90)
+        ct(70, txt)
+    drawDots()
+
+# ---------- Start ----------
+clear()
+textFont(FONT_ROBOTO_24)
+ct(108, "TOF startet ~10 s")
+update()
+TOF.init()
+TOF.set4x4()
+
+def onDraw():
+    now:long = millis()
+    trackHand(now)
+    drawPage(now)
+    update()
+    if getButton():
+        if returnToMenu():
+            return

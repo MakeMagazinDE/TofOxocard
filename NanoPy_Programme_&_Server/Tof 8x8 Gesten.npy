@@ -1,0 +1,242 @@
+# Gesten-Erkennung mit dem 8x8 ToF: Handposition relativ zur Sensormitte
+# Ausgabe: NICHTS, VORN, HINTEN, LINKS, RECHTS, AKTION (starke Annaeherung)
+# Mitte = Ausgabe einfrieren/weiterlaufen, runter = beenden
+
+import tof
+
+const HANDMAX = 450      # naeher als 45 cm gilt als Hand
+const MINZONES = 5       # so viele Zonen muessen die Hand sehen
+const POSMIN = 0.5       # ab dieser Auslenkung zaehlt eine Richtung
+const FRONTMIN = 1.2     # seitliche Auslenkung, ab der "vorn" nicht mehr gewinnt
+const FRONTSPREAD = 2.6  # ab dieser vertikalen Streuung gilt "vorn"
+const NEARMM = 220       # mittlere Distanz fuer "Aktion"
+const FISTZONES = 10     # so viele Zonen muessen dabei nah sein
+const HOLDCOUNT = 2      # so oft muss die Richtung stabil sein
+const ROTATE = 1
+const MIRRORX = 1
+const MIRRORY = 0
+
+TOF.init()
+TOF.set8x8()
+
+lastMid = false
+lastDown = false
+frozen = false
+lastShow = 0
+lastDir = 0
+sameCount = 0
+
+def ct(y:int, s:byte[]):
+    w = textWidth(s)
+    drawText(120 - w / 2, y, s)
+
+def cellOf(i:int)->int:
+    c0 = i % 8
+    r0 = i / 8
+    c = c0
+    r = r0
+    if ROTATE == 1:
+        c = 7 - r0
+        r = c0
+    if ROTATE == 2:
+        c = 7 - c0
+        r = 7 - r0
+    if ROTATE == 3:
+        c = r0
+        r = 7 - c0
+    if MIRRORX == 1:
+        c = 7 - c
+    if MIRRORY == 1:
+        r = 7 - r
+    return r * 8 + c
+
+def drawRaster(cx:float, cy:float, n:int):
+    noStroke()
+    for i in 64:
+        cell = cellOf(i)
+        x = 40 + (cell % 8) * 20
+        y = 40 + (cell / 8) * 20
+        st = TOF.status[i]
+        if st == 5 or st == 9:
+            if TOF.data[i] < HANDMAX:
+                t = 1.0 * TOF.data[i] / HANDMAX
+                fill(255.0 * (1.0 - t), 120.0 * (1.0 - t), 60.0 * t)
+            else:
+                fill(30, 30, 40)
+        else:
+            fill(20, 20, 26)
+        drawRectangle(x, y, 18, 18)
+
+    noStroke()
+    stroke(70, 70, 90)
+    drawLine(40 + 4 * 20, 40, 40 + 4 * 20, 40 + 8 * 20)
+    drawLine(40, 40 + 4 * 20, 40 + 8 * 20, 40 + 4 * 20)
+
+    if n >= MINZONES:
+        noStroke()
+        fill(255, 255, 255)
+        drawCircle(40 + cx * 20 + 9, 40 + cy * 20 + 9, 4)
+
+def onDraw():
+    b = getButtons()
+
+    if b.middle == 1 and lastMid == false:
+        if frozen:
+            frozen = false
+        else:
+            frozen = true
+    if b.middle == 1:
+        lastMid = true
+    else:
+        lastMid = false
+
+    if b.down == 1 and lastDown == false:
+        returnToMenu()
+        return
+    if b.down == 1:
+        lastDown = true
+    else:
+        lastDown = false
+
+    cxDraw = 3.5
+    cyDraw = 3.5
+    nDraw = 0
+    meanD = 0.0
+    nearCnt = 0
+
+    if frozen == false:
+        TOF.getData()
+
+        n = 0
+        sx = 0.0
+        sy = 0.0
+        sx2 = 0.0
+        sy2 = 0.0
+        dSum = 0.0
+        near = 0
+        ryMin = 9
+        ryMax = -1
+
+        for i in 64:
+            st = TOF.status[i]
+            if st == 5 or st == 9:
+                if TOF.data[i] < HANDMAX:
+                    cell = cellOf(i)
+                    c = cell % 8
+                    r = cell / 8
+                    sx = sx + c
+                    sy = sy + r
+                    sx2 = sx2 + c * c
+                    sy2 = sy2 + r * r
+                    dSum = dSum + TOF.data[i]
+                    if r < ryMin:
+                        ryMin = r
+                    if r > ryMax:
+                        ryMax = r
+                    if TOF.data[i] < NEARMM:
+                        near = near + 1
+                    n = n + 1
+
+        dirTxt = 0
+
+        if n >= MINZONES:
+            cx = sx / n
+            cy = sy / n
+            meanD = dSum / n
+
+            vx = sx2 - n * cx * cx
+            vy = sy2 - n * cy * cy
+            if vx < 0.0:
+                vx = 0.0
+            if vy < 0.0:
+                vy = 0.0
+
+            dx = cx - 3.5
+            dy = cy - 3.5
+            ax = dx
+            if ax < 0.0:
+                ax = 0.0 - ax
+            ay = dy
+            if ay < 0.0:
+                ay = 0.0 - ay
+
+            # Aktion: starke Annaeherung
+            if meanD < NEARMM and near >= FISTZONES:
+                dirTxt = 5
+            else:
+                # vorn: die Hand ist im Bild vertikal gespreizt
+                # (oben und unten Zonen, Mitte oft leer) und liegt tief
+                spreadY = 0.0
+                if n > 1:
+                    spreadY = vy / n
+
+                # Seitenrichtungen haben Vorrang: klar ausgelenkt -> links/rechts
+                if ax >= POSMIN and ax >= ay:
+                    if dx > 0.0:
+                        dirTxt = 4
+                    else:
+                        dirTxt = 3
+                else:
+                    # vorn: deutlich vertikal gespreizt und tief im Bild
+                    if ax < FRONTMIN and spreadY >= FRONTSPREAD and cy > 3.6:
+                        dirTxt = 1
+                    else:
+                        if ay >= POSMIN:
+                            if dy > 0.0:
+                                dirTxt = 2
+                            else:
+                                dirTxt = 1
+
+        cxDraw = cx
+        cyDraw = cy
+        nDraw = n
+
+        if dirTxt > 0:
+            if dirTxt == lastDir:
+                sameCount = sameCount + 1
+            else:
+                sameCount = 0
+                lastDir = dirTxt
+            if sameCount >= HOLDCOUNT:
+                lastShow = dirTxt
+        else:
+            lastDir = 0
+            sameCount = 0
+            lastShow = 0
+
+    background(0, 0, 0)
+    stroke(200, 200, 210)
+    textFont(FONT_ROBOTO_16)
+    ct(10, "8x8 Position")
+
+    drawRaster(cxDraw, cyDraw, nDraw)
+
+    stroke(255, 255, 255)
+    textFont(FONT_ROBOTO_32)
+    if lastShow == 5:
+        stroke(255, 180, 60)
+
+    if frozen:
+        stroke(130, 130, 160)
+
+    if lastShow == 0:
+        ct(196, "NICHTS")
+    if lastShow == 1:
+        ct(196, "VORN")
+    if lastShow == 2:
+        ct(196, "HINTEN")
+    if lastShow == 3:
+        ct(196, "LINKS")
+    if lastShow == 4:
+        ct(196, "RECHTS")
+    if lastShow == 5:
+        ct(196, "AKTION")
+
+    stroke(140, 140, 160)
+    textFont(FONT_ROBOTO_16)
+    if frozen:
+        ct(226, "Mitte = weiter")
+    else:
+        ct(226, "Mitte = halten")
+
+    update()

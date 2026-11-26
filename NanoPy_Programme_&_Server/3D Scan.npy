@@ -1,0 +1,375 @@
+# 3D-Scanner mit ToF-Cartridge (NanoPy)
+# Nur weiter Hintergrund (> MAXDIST) wird ignoriert, sonst kein Filter
+# Vorschau: links/rechts = Abstand zur Tellermitte, Mitte = Scan (nach 10 s), runter = Ende
+# Ansicht:  links/rechts = drehen, hoch/runter = näher/weiter, Mitte = zurück zur Vorschau
+
+import tof
+
+const STEPS = 16       # Drehschritte pro Umdrehung
+const STARTMS = 10000  # Countdown vor dem ersten Scan (ms)
+const TURNMS = 10000   # Zeit zum Weiterdrehen (ms)
+const AVG = 4          # Messbilder pro Position
+const BEHIND = 150.0   # so weit hinter der Drehachse wird noch gemessen (mm)
+const SENSORH = 65.0   # Höhe der Sensormitte über dem Tisch (mm)
+const TURNR = 80.0     # Radius des Drehtellers, nur zur Orientierung gezeichnet
+const ZONEDEG = 5.6    # Öffnungswinkel einer Zone
+const DISTMODE = 0     # 0 = Abstand entlang des Strahls, 1 = senkrechter Abstand
+const TURNDIR = 1.0    # -1.0, wenn das Modell spiegelverkehrt aussieht
+const ROTATE = 1
+const MIRRORX = 1
+const MIRRORY = 0
+const MAXP = 1024      # 16 Schritte x 64 Zonen
+const FOCAL = 220.0
+const NBINS = 64       # Tiefenstufen für die Sortierung
+
+AXISDIST = 250.0       # Abstand Sensor -> Drehachse (mm), in der Vorschau einstellbar
+MAXDIST = 400.0        # = AXISDIST + BEHIND, wird automatisch angepasst
+
+px:float[1024]         # Punktwolke
+py:float[1024]
+pz:float[1024]
+ps:float[1024]         # Größe der Zone am Punkt (mm)
+pDep:float[1024]       # Tiefe in der aktuellen Ansicht
+pBin:int[1024]
+order:int[1024]
+binCnt:int[64]
+binStart:int[64]
+nPts = 0
+zSum:long[64]
+zCnt:int[64]
+
+ptX = 0.0
+ptZ = 0.0
+ptH = 0.0
+
+appState = 0           # 0 Vorschau, 1 Warten/Drehen, 2 Messen, 3 Ansicht
+stepK = 0
+frameK = 0
+phaseStart:long
+camAng = 0.0
+camDist = 600.0
+hMin = 0.0
+hMax = 1.0
+hMid = 0.0
+dirty = true
+lastMid = false
+lastDown = false
+lastL = false
+lastR = false
+scrX:int
+scrY:int
+projDep = 0.0
+colR:int
+colG:int
+colB:int
+
+def ct(y:int, s:byte[]):
+    w = textWidth(s)
+    drawText(120 - w / 2, y, s)
+
+# ---------- Zone -> Spalte/Zeile ----------
+def cellOf(i:int)->int:
+    c0 = i % 8
+    r0 = i / 8
+    c = c0
+    r = r0
+    if ROTATE == 1:
+        c = 7 - r0
+        r = c0
+    if ROTATE == 2:
+        c = 7 - c0
+        r = 7 - r0
+    if ROTATE == 3:
+        c = r0
+        r = 7 - c0
+    if MIRRORX == 1:
+        c = 7 - c
+    if MIRRORY == 1:
+        r = 7 - r
+    return r * 8 + c
+
+# ---------- Zone + Abstand -> 3D-Punkt ----------
+def zonePoint(i:int, d:float):
+    cell = cellOf(i)
+    col = cell % 8
+    row = cell / 8
+    ax = (1.0 * col - 3.5) * ZONEDEG * 0.017453
+    ay = (3.5 - 1.0 * row) * ZONEDEG * 0.017453
+    fwd = d
+    sid = 0.0
+    up = 0.0
+    if DISTMODE == 0:                  # Abstand entlang des Strahls
+        fwd = d * cos(ay) * cos(ax)
+        sid = d * cos(ay) * sin(ax)
+        up = d * sin(ay)
+    else:                              # senkrechter Abstand
+        sid = d * sin(ax) / cos(ax)
+        up = d * sin(ay) / cos(ay)
+    ptX = sid
+    ptZ = fwd - AXISDIST
+    ptH = SENSORH + up
+
+# ---------- Messen ----------
+def clearSums():
+    for i in 64:
+        zSum[i] = 0
+        zCnt[i] = 0
+
+def measureFrame():
+    TOF.getData()
+    for i in 64:
+        st = TOF.status[i]
+        if st == 5 or st == 9:
+            zSum[i] = zSum[i] + TOF.data[i]
+            zCnt[i] = zCnt[i] + 1
+
+def storeStep():
+    # gültige Zonen übernehmen, nur weiter Hintergrund wird ignoriert
+    th = 6.28318 * stepK / STEPS * TURNDIR
+    cth = cos(th)
+    sth = sin(th)
+    for i in 64:
+        if zCnt[i] * 2 >= AVG and nPts < MAXP:
+            d = 1.0 * zSum[i] / zCnt[i]
+            if d <= MAXDIST:
+                zonePoint(i, d)
+                px[nPts] = ptX * cth - ptZ * sth
+                pz[nPts] = ptX * sth + ptZ * cth
+                py[nPts] = ptH
+                ps[nPts] = d * ZONEDEG * 0.017453
+                nPts = nPts + 1
+    clearSums()
+
+def computeBounds():
+    hMin = 99999.0
+    hMax = -99999.0
+    k = 0
+    while k < nPts:
+        if py[k] < hMin:
+            hMin = py[k]
+        if py[k] > hMax:
+            hMax = py[k]
+        k = k + 1
+    if nPts == 0:
+        hMin = 0.0
+        hMax = 1.0
+    hMid = (hMin + hMax) / 2.0
+
+# ---------- Live-Vorschau: komplette Szene ----------
+def drawPreview():
+    background(0, 0, 0)
+    noStroke()
+    for i in 64:
+        cell = cellOf(i)
+        x = 32 + (cell % 8) * 22
+        y = 26 + (cell / 8) * 22
+        st = TOF.status[i]
+        if st == 5 or st == 9:
+            if TOF.data[i] > MAXDIST:
+                fill(70, 15, 15)                        # wird ignoriert: dunkelrot
+            else:
+                t = 1.0 * TOF.data[i] / MAXDIST         # nah = hell, fern = dunkel
+                if t > 1.0:
+                    t = 1.0
+                colR = 60.0 * (1.0 - t)
+                colG = 140.0 * (1.0 - t)
+                colB = 255.0 - t * 200.0
+                fill(colR, colG, colB)
+        else:
+            fill(25, 25, 30)                            # ungültige Messung
+        drawRectangle(x, y, 20, 20)
+    textFont(FONT_ROBOTO_16)
+    stroke(255, 255, 255)
+    ad:int = AXISDIST / 10.0
+    ct(4, "Abstand " + ad + " cm  < >")
+    stroke(150, 150, 170)
+    ct(210, "Mitte = Scan  runter = Ende")
+    update()
+
+# ---------- Ansicht ----------
+def project(wx:float, wy:float, wz:float, ca:float, sa:float)->bool:
+    cx = wx * ca - wz * sa
+    cz = wx * sa + wz * ca
+    projDep = cz + camDist
+    if projDep < 30.0:
+        return false
+    scrX = 120.0 + FOCAL * cx / projDep
+    scrY = 110.0 - FOCAL * (wy - hMid) / projDep
+    return true
+
+def heightColor(h:float):
+    t = (h - hMin) / (hMax - hMin + 1.0)
+    colR = 255.0 * (1.0 - t)
+    colB = 255.0 * t
+    g = 2.0 * t - 1.0
+    if g < 0.0:
+        g = 0.0 - g
+    colG = 255.0 * (1.0 - g)
+
+def sortByDepth(ca:float, sa:float):
+    # Zählsortierung in Tiefenstufen, Bereich passt sich an die Punkte an
+    czMin = 99999.0
+    czMax = -99999.0
+    k = 0
+    while k < nPts:
+        cz = px[k] * sa + pz[k] * ca
+        pDep[k] = cz
+        if cz < czMin:
+            czMin = cz
+        if cz > czMax:
+            czMax = cz
+        k = k + 1
+    rng = czMax - czMin + 1.0
+    for b in NBINS:
+        binCnt[b] = 0
+    k = 0
+    while k < nPts:
+        bn:int = (pDep[k] - czMin) / rng * NBINS
+        if bn < 0:
+            bn = 0
+        if bn > NBINS - 1:
+            bn = NBINS - 1
+        pBin[k] = bn
+        binCnt[bn] = binCnt[bn] + 1
+        k = k + 1
+    pos = 0
+    b = NBINS - 1
+    while b >= 0:                      # hinten zuerst
+        binStart[b] = pos
+        pos = pos + binCnt[b]
+        b = b - 1
+    k = 0
+    while k < nPts:
+        bn = pBin[k]
+        order[binStart[bn]] = k
+        binStart[bn] = binStart[bn] + 1
+        k = k + 1
+
+def drawView():
+    background(0, 0, 0)
+    ca = cos(camAng)
+    sa = sin(camAng)
+    noStroke()
+    fill(70, 70, 80)                   # Drehteller zur Orientierung
+    for k in 24:
+        a = 0.2618 * k
+        if project(TURNR * cos(a), 0.0, TURNR * sin(a), ca, sa):
+            drawRectangle(scrX - 1, scrY - 1, 3, 3)
+    sortByDepth(ca, sa)
+    j = 0
+    while j < nPts:
+        k = order[j]
+        if project(px[k], py[k], pz[k], ca, sa):
+            sz:int = FOCAL * ps[k] * 1.2 / projDep
+            if sz < 2:
+                sz = 2
+            if sz > 16:
+                sz = 16
+            heightColor(py[k])
+            fill(colR, colG, colB)
+            drawRectangle(scrX - sz / 2, scrY - sz / 2, sz, sz)
+        j = j + 1
+    textFont(FONT_ROBOTO_16)
+    stroke(150, 150, 170)
+    ct(4, "" + nPts + " Punkte")
+    ct(220, "Mitte = Vorschau")
+    update()
+
+def drawInfo(title:byte[], l1:byte[], l2:byte[]):
+    background(15, 15, 25)
+    stroke(255, 255, 255)
+    textFont(FONT_ROBOTO_32)
+    ct(60, title)
+    textFont(FONT_ROBOTO_24)
+    ct(120, l1)
+    ct(160, l2)
+    update()
+
+# ---------- Start ----------
+clear()
+textFont(FONT_ROBOTO_24)
+ct(108, "TOF startet ~10 s")
+update()
+TOF.init()
+TOF.set8x8()
+clearSums()
+
+def onDraw():
+    b = getButtons()
+    midP = b.middle and lastMid == false
+    downP = b.down and lastDown == false
+    leftP = b.left and lastL == false
+    rightP = b.right and lastR == false
+    lastMid = b.middle
+    lastDown = b.down
+    lastL = b.left
+    lastR = b.right
+    now:long = millis()
+
+    if appState == 0:                          # Vorschau
+        if leftP and AXISDIST > 60.0:
+            AXISDIST = AXISDIST - 10.0
+        if rightP and AXISDIST < 600.0:
+            AXISDIST = AXISDIST + 10.0
+        MAXDIST = AXISDIST + BEHIND
+        TOF.getData()
+        drawPreview()
+        if downP:
+            if returnToMenu():
+                return
+        if midP:
+            nPts = 0
+            stepK = 0
+            frameK = 0
+            clearSums()
+            appState = 1
+            phaseStart = millis()
+
+    if appState == 1:                          # Countdown bzw. Weiterdrehen
+        waitMs = TURNMS
+        if stepK == 0:
+            waitMs = STARTMS
+        rest:long = (waitMs - (now - phaseStart)) / 1000 + 1
+        if stepK == 0:
+            drawInfo("Hand weg", "Scan beginnt in", "" + rest + " s")
+        else:
+            drawInfo("Drehen", "Schritt " + (stepK + 1) + "/" + STEPS, "" + rest + " s")
+        if now - phaseStart >= waitMs:
+            appState = 2
+            frameK = 0
+
+    if appState == 2:                          # Messen
+        if frameK == 0:
+            drawInfo("Messen", "nicht bewegen", "")
+        measureFrame()
+        frameK = frameK + 1
+        if frameK >= AVG:
+            storeStep()
+            stepK = stepK + 1
+            if stepK >= STEPS:
+                computeBounds()
+                camAng = 0.0
+                dirty = true
+                appState = 3
+            else:
+                appState = 1
+                phaseStart = millis()
+
+    if appState == 3:                          # Ansicht
+        if b.left:
+            camAng = camAng - 0.08
+            dirty = true
+        if b.right:
+            camAng = camAng + 0.08
+            dirty = true
+        if b.up and camDist > 150.0:
+            camDist = camDist - 20.0
+            dirty = true
+        if b.down and camDist < 3000.0:
+            camDist = camDist + 20.0
+            dirty = true
+        if dirty:
+            drawView()
+            dirty = false
+        if midP:
+            appState = 0

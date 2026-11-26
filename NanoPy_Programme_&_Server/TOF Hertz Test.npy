@@ -1,0 +1,105 @@
+# ToF-Gegentest: wartet getData() auf den Sensor oder dauert das Auslesen?
+# links = 4x4, rechts = 8x8, hoch/runter = Pause vor getData, Mitte = beenden
+
+import tof
+
+delays:int[4] = [0, 20, 50, 100]   # künstliche Pause vor getData (ms)
+dIdx = 0
+n = 8
+loops = 0
+changes = 0
+getSum:long
+changesHz = 0
+getAvg = 0
+prevChk:long
+lastSec:long
+lastL = false
+lastR = false
+lastU = false
+lastD = false
+
+def ct(y:int, s:byte[]):
+    w = textWidth(s)
+    drawText(120 - w / 2, y, s)
+
+def resetCount():
+    loops = 0
+    changes = 0
+    getSum = 0
+    lastSec = millis()
+
+def show():
+    clear()
+    stroke(255, 255, 255)
+    textFont(FONT_ROBOTO_24)
+    ct(4, "" + n + "x" + n + "  Pause " + delays[dIdx])
+
+    textFont(FONT_ROBOTO_16)
+    stroke(150, 150, 170)
+    ct(50, "Bilder/s")
+    ct(120, "getData ms")
+
+    textFont(FONT_ROBOTO_32)
+    stroke(255, 255, 255)
+    ct(70, "" + changesHz)
+    ct(140, "" + getAvg)
+
+    textFont(FONT_ROBOTO_16)
+    stroke(150, 150, 170)
+    ct(200, "< > Modus   ^ v Pause")
+    update()
+
+clear()
+textFont(FONT_ROBOTO_16)
+ct(110, "TOF startet ~10 s")
+update()
+TOF.init()
+TOF.set8x8()
+resetCount()
+
+def onDraw():
+    b = getButtons()
+    if b.left and lastL == false and n != 4:
+        TOF.set4x4()
+        n = 4
+        resetCount()
+    if b.right and lastR == false and n != 8:
+        TOF.set8x8()
+        n = 8
+        resetCount()
+    if b.up and lastU == false and dIdx < 3:
+        dIdx = dIdx + 1
+        resetCount()
+    if b.down and lastD == false and dIdx > 0:
+        dIdx = dIdx - 1
+        resetCount()
+    lastL = b.left
+    lastR = b.right
+    lastU = b.up
+    lastD = b.down
+
+    if dIdx > 0:
+        delay(delays[dIdx])            # simuliert andere Arbeit, z. B. Zeichnen
+
+    t0:long = millis()
+    TOF.getData()
+    t1:long = millis()
+    getSum = getSum + (t1 - t0)
+    loops = loops + 1
+
+    chk:long = 0
+    for i in n * n:
+        chk = chk + TOF.data[i] * (i + 1)
+    if chk != prevChk:
+        changes = changes + 1
+        prevChk = chk
+
+    if t1 - lastSec >= 1000:
+        changesHz = changes
+        getAvg = getSum / loops
+        resetCount()
+        show()
+
+    if b.middle:
+        if returnToMenu():
+            return

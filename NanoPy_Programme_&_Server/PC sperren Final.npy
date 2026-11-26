@@ -1,0 +1,599 @@
+# ------------------------------------------------------------
+# Oxocard Connect + ToF
+#
+# Automatische PC-Sperre:
+#
+# 1. Normale Sitzposition wird beim Start gelernt
+# 2. Position deutlich anders -> 20 Sekunden warten
+# 3. Danach "Noch da?" fuer 10 Sekunden
+# 4. Keine Rueckkehr / keine Bestaetigung -> PC sperren
+#
+# Joystick:
+#   MITTE  = bei "Noch da?" bestaetigen und neu kalibrieren
+#   RECHTS = jederzeit Position neu kalibrieren
+#   LINKS  = Programm verlassen
+# ------------------------------------------------------------
+
+import tof
+
+
+# ---------------- ZEITEN ----------------
+
+const AWAY_WAIT_MS = 20000
+const QUESTION_MS = 10000
+
+# Nach einer Sperre muss die erkannte Rueckkehr
+# so lange stabil sein, bevor neu scharf geschaltet wird.
+const RETURN_STABLE_MS = 3000
+
+# Falls der PC nicht erreichbar war:
+const RETRY_MS = 10000
+
+
+# ---------------- PROFIL ----------------
+
+# Ein ToF-Wert darf sich pro Zone um diesen Wert
+# veraendern und gilt trotzdem noch als "gleiche Position".
+#
+# 300 mm = 30 cm
+const MATCH_MM = 220
+
+# Vom naechsten gemessenen Koerperpunkt aus werden
+
+const PROFILE_DEPTH_MM = 350
+
+# Noch weiter entfernte Flaechen werden nicht ins
+# Personenprofil aufgenommen.
+const MAX_PROFILE_MM = 1800
+
+# Anzahl Messungen fuer eine neue Kalibrierung
+const CAL_SAMPLES = 24
+
+const CAL_DELAY_MS = 60
+
+
+# ---------------- NETZWERK ----------------
+
+# IP-Adresse DEINES PCs
+lockUrl:byte[80] = ""
+
+# MUSS mit TOKEN im Python-Programm identisch sein
+lockToken:byte[80] = ""
+
+
+# ---------------- PROFILDATEN ----------------
+
+base:int[16]
+baseUse:bool[16]
+
+sums:long[16]
+counts:int[16]
+
+
+# ---------------- STATUS ----------------
+#
+# 0 = Anwesend
+# 1 = Position verlassen, 30-s-Wartezeit
+# 2 = "Noch da?" / 20-s-Wartezeit
+# 3 = PC gesperrt
+# 4 = PC nicht erreichbar
+
+state = 0
+
+present = false
+
+matchCount = 0
+profileZones = 0
+requiredMatches = 1
+
+awaySince:long
+questionSince:long
+
+returnSince:long
+returnOn = false
+
+lastTry:long
+
+presentFrames = 0
+absentFrames = 0
+
+const PRESENT_FRAMES = 4
+const ABSENT_FRAMES = 5
+
+# ------------------------------------------------------------
+# Text zentrieren
+# ------------------------------------------------------------
+
+def ct(y:int, s:byte[]):
+    w = textWidth(s)
+    drawText(120 - w / 2, y, s)
+
+
+# ------------------------------------------------------------
+# Kalibrierungsbild
+# ------------------------------------------------------------
+
+def drawCalibration():
+    background(30, 70, 130)
+    stroke(255, 255, 255)
+
+    textFont(FONT_ROBOTO_32)
+    ct(45, "Kalibrierung")
+
+    textFont(FONT_ROBOTO_24)
+    ct(100, "Bitte normal")
+    ct(132, "hinsetzen")
+
+    textFont(FONT_ROBOTO_16)
+    ct(190, "Position wird gelernt")
+
+    update()
+
+
+# ------------------------------------------------------------
+# Sitzposition neu lernen
+# ------------------------------------------------------------
+
+def calibrate():
+
+    drawCalibration()
+
+    # Arrays zuruecksetzen
+    for i in 16:
+        sums[i] = 0
+        counts[i] = 0
+        base[i] = 0
+        baseUse[i] = false
+
+    # Mehrere ToF-Messungen mitteln
+    for n in CAL_SAMPLES:
+
+        TOF.getData()
+
+        for i in 16:
+
+            if TOF.status[i] == 5 or TOF.status[i] == 9:
+
+                d = TOF.data[i]
+
+                if d > 50 and d <= 4000:
+                    sums[i] += d
+                    counts[i] += 1
+
+        delay(CAL_DELAY_MS)
+
+
+    # Mittelwerte ausrechnen und naechsten Punkt suchen
+    nearest = 9999
+
+    for i in 16:
+
+        if counts[i] >= CAL_SAMPLES / 2:
+
+            base[i] = sums[i] / counts[i]
+
+            if base[i] < nearest:
+                nearest = base[i]
+
+
+    # Aus den nahen Zonen ein Personenprofil bauen
+    profileZones = 0
+
+    for i in 16:
+
+        baseUse[i] = false
+
+        if counts[i] >= CAL_SAMPLES / 2:
+
+            if base[i] <= MAX_PROFILE_MM:
+
+                if base[i] <= nearest + PROFILE_DEPTH_MM:
+
+                    baseUse[i] = true
+                    profileZones += 1
+
+
+    # Es soll nicht eine einzige Zone genuegen.
+    # Rund 75 % des Profils muessen passen
+    requiredMatches = profileZones * 3 / 4
+
+    if requiredMatches < 2:
+        requiredMatches = 2
+
+    if requiredMatches > profileZones:
+        requiredMatches = profileZones
+
+    # Falls der Sensor beim Kalibrieren nur sehr wenige
+    # brauchbare Zonen gefunden hat.
+    if requiredMatches > profileZones:
+        requiredMatches = profileZones
+
+    if requiredMatches < 1:
+        requiredMatches = 1
+
+
+    state = 0
+    present = true
+    returnOn = false
+
+    background(30, 140, 60)
+    stroke(255, 255, 255)
+
+    textFont(FONT_ROBOTO_32)
+    ct(70, "Bereit")
+
+    textFont(FONT_ROBOTO_24)
+    ct(125, "" + profileZones + " Profilzonen")
+
+    update()
+
+    delay(900)
+
+
+# ------------------------------------------------------------
+# Aktuelle Messung mit Sitzprofil vergleichen
+# ------------------------------------------------------------
+
+def measure():
+
+    TOF.getData()
+
+    matches = 0
+
+    for i in 16:
+
+        if baseUse[i]:
+
+            if TOF.status[i] == 5 or TOF.status[i] == 9:
+
+                d = TOF.data[i]
+
+                diff = d - base[i]
+
+                if diff < 0:
+                    diff = -diff
+
+                if diff <= MATCH_MM:
+                    matches += 1
+
+    matchCount = matches
+
+
+    # ----------------------------------------
+    # Rohentscheidung
+    # ----------------------------------------
+
+    rawPresent = matchCount >= requiredMatches
+
+
+    # ----------------------------------------
+    # Entprellen
+    # ----------------------------------------
+
+    if rawPresent:
+
+        presentFrames += 1
+        absentFrames = 0
+
+        if presentFrames >= PRESENT_FRAMES:
+            present = true
+
+    else:
+
+        absentFrames += 1
+        presentFrames = 0
+
+        if absentFrames >= ABSENT_FRAMES:
+            present = false
+# ------------------------------------------------------------
+# Sperrbefehl an den PC
+# ------------------------------------------------------------
+
+def tryLock():
+
+    background(30, 45, 90)
+    stroke(255, 255, 255)
+
+    textFont(FONT_ROBOTO_32)
+    ct(90, "Sperre PC ...")
+
+    update()
+
+
+    # Alten Header-Zustand entfernen
+    clearRequestHeaders()
+
+    # Geheimen Schluessel als Header senden
+    addRequestHeader("X-Oxocard-Key", lockToken)
+
+    ok = getRequest(lockUrl)
+
+    clearRequestHeaders()
+
+
+    if ok:
+        state = 3
+    else:
+        state = 4
+
+    lastTry = millis()
+    returnOn = false
+
+
+# ------------------------------------------------------------
+# Statusautomat
+# ------------------------------------------------------------
+
+def updateState(now:long):
+
+    # --------------------------------------------------------
+    # 0 = normale Anwesenheit
+    # --------------------------------------------------------
+
+    if state == 0:
+
+        if present == false:
+            state = 1
+            awaySince = now
+
+        return
+
+
+    # --------------------------------------------------------
+    # 1 = Position verlassen
+    # 30 Sekunden warten
+    # --------------------------------------------------------
+
+    if state == 1:
+
+        # Wieder gleiche Position erkannt
+        if present:
+            state = 0
+
+        else:
+
+            if now - awaySince >= AWAY_WAIT_MS:
+
+                state = 2
+                questionSince = now
+
+        return
+
+
+    # --------------------------------------------------------
+    # 2 = "Noch da?"
+    # weitere 20 Sekunden
+    # --------------------------------------------------------
+
+    if state == 2:
+
+        # Automatische Rueckkehrerkennung
+        if present:
+            state = 0
+
+        else:
+
+            if now - questionSince >= QUESTION_MS:
+                tryLock()
+
+        return
+
+
+    # --------------------------------------------------------
+    # 3 / 4
+    # Nach Sperre oder Netzwerkfehler auf Rueckkehr warten
+    # --------------------------------------------------------
+
+    if present:
+
+        if returnOn == false:
+            returnOn = true
+            returnSince = now
+
+        if now - returnSince >= RETURN_STABLE_MS:
+            state = 0
+            returnOn = false
+
+    else:
+
+        returnOn = false
+
+        # Bei Netzwerkfehler alle 10 Sekunden erneut versuchen
+        if state == 4:
+
+            if now - lastTry >= RETRY_MS:
+                tryLock()
+
+
+# ------------------------------------------------------------
+# Anzeige
+# ------------------------------------------------------------
+
+def drawScreen(now:long):
+
+    # Farben nach Status
+
+    if state == 0:
+        background(30, 140, 60)
+
+    if state == 1:
+        background(190, 140, 20)
+
+    if state == 2:
+        background(210, 90, 20)
+
+    if state == 3:
+        background(30, 45, 90)
+
+    if state == 4:
+        background(170, 30, 30)
+
+
+    stroke(255, 255, 255)
+
+
+    # --------------------------------------------------------
+    # ANWESEND
+    # --------------------------------------------------------
+
+    if state == 0:
+
+        textFont(FONT_ROBOTO_32)
+        ct(25, "Anwesend")
+
+        textFont(FONT_ROBOTO_48)
+        ct(80, "" + matchCount + "/" + profileZones)
+
+        textFont(FONT_ROBOTO_16)
+        ct(145, "Profil-Treffer")
+
+        textFont(FONT_ROBOTO_16)
+        ct(190, "Rechts: neu lernen")
+        ct(215, "Links: beenden")
+
+
+    # --------------------------------------------------------
+    # 30 Sekunden weg
+    # --------------------------------------------------------
+
+    if state == 1:
+
+        rest:long = (AWAY_WAIT_MS - (now - awaySince)) / 1000 + 1
+
+        textFont(FONT_ROBOTO_32)
+        ct(20, "Position weg")
+
+        textFont(FONT_ROBOTO_80)
+        ct(65, "" + rest)
+
+        textFont(FONT_ROBOTO_24)
+        ct(155, "Sekunden")
+
+        textFont(FONT_ROBOTO_16)
+        ct(205, "Rueckkehr bricht ab")
+
+
+    # --------------------------------------------------------
+    # Noch da?
+    # --------------------------------------------------------
+
+    if state == 2:
+
+        rest2:long = (QUESTION_MS - (now - questionSince)) / 1000 + 1
+
+        textFont(FONT_ROBOTO_32)
+        ct(18, "Noch da?")
+
+        textFont(FONT_ROBOTO_80)
+        ct(60, "" + rest2)
+
+        textFont(FONT_ROBOTO_24)
+        ct(150, "bis Sperre")
+
+        textFont(FONT_ROBOTO_16)
+        ct(195, "MITTE = Ja")
+        ct(217, "Position wird neu gelernt")
+
+
+    # --------------------------------------------------------
+    # Gesperrt
+    # --------------------------------------------------------
+
+    if state == 3:
+
+        textFont(FONT_ROBOTO_32)
+        ct(55, "PC gesperrt")
+
+        textFont(FONT_ROBOTO_24)
+        ct(120, "Warte auf")
+        ct(150, "Rueckkehr")
+
+        textFont(FONT_ROBOTO_16)
+        ct(210, "Rechts: neu lernen")
+
+
+    # --------------------------------------------------------
+    # Netzwerkfehler
+    # --------------------------------------------------------
+
+    if state == 4:
+
+        rest3:long = (RETRY_MS - (now - lastTry)) / 1000 + 1
+
+        if rest3 < 0:
+            rest3 = 0
+
+        textFont(FONT_ROBOTO_32)
+        ct(30, "PC nicht")
+        ct(67, "erreichbar")
+
+        textFont(FONT_ROBOTO_48)
+        ct(112, "" + rest3)
+
+        textFont(FONT_ROBOTO_16)
+        ct(180, "Sek. bis Versuch")
+        ct(215, "Links: beenden")
+
+
+# ------------------------------------------------------------
+# START
+# ------------------------------------------------------------
+
+clear()
+
+background(30, 70, 130)
+stroke(255, 255, 255)
+
+textFont(FONT_ROBOTO_32)
+ct(45, "ToF startet")
+
+textFont(FONT_ROBOTO_24)
+ct(105, "Bitte normal")
+ct(135, "am PC sitzen")
+
+textFont(FONT_ROBOTO_16)
+ct(195, "Initialisierung ~10 s")
+
+update()
+
+
+TOF.init()
+TOF.set4x4()
+
+calibrate()
+
+
+# ------------------------------------------------------------
+# HAUPTSCHLEIFE
+# ------------------------------------------------------------
+
+def onDraw():
+
+    button = getButton()
+
+    if button == 5:
+        if returnToMenu():
+            return
+
+    if button == 3:
+        while getButton():
+            delay(50)
+        calibrate()
+
+    if button == 1 and state == 2:
+        while getButton():
+            delay(50)
+        calibrate()
+
+
+    measure()
+
+    now:long = millis()
+
+    updateState(now)
+
+    drawScreen(millis())
+
+    update()
+
+    delay(40)

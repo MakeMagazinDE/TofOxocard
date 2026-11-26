@@ -1,0 +1,94 @@
+# ToF-Diagnose: wo geht die Zeit verloren?
+# links = 4x4, rechts = 8x8, Mitte = beenden
+
+import tof
+
+n = 8
+loops = 0              # Schleifendurchläufe pro Sekunde
+changes = 0            # neue Messbilder pro Sekunde
+getSum:long            # Summe der getData()-Zeiten
+loopsHz = 0
+changesHz = 0
+getAvg = 0
+prevChk:long
+lastSec:long
+lastL = false
+lastR = false
+
+def ct(y:int, s:byte[]):
+    w = textWidth(s)
+    drawText(120 - w / 2, y, s)
+
+def resetCount():
+    loops = 0
+    changes = 0
+    getSum = 0
+    lastSec = millis()
+
+def show():
+    clear()
+    stroke(255, 255, 255)
+    textFont(FONT_ROBOTO_24)
+    ct(4, "" + n + "x" + n)
+
+    textFont(FONT_ROBOTO_16)
+    stroke(150, 150, 170)
+    ct(40, "Schleife/s")
+    ct(100, "Bilder/s")
+    ct(160, "getData ms")
+
+    textFont(FONT_ROBOTO_32)
+    stroke(255, 255, 255)
+    ct(58, "" + loopsHz)
+    ct(118, "" + changesHz)
+    ct(178, "" + getAvg)
+
+    textFont(FONT_ROBOTO_16)
+    stroke(150, 150, 170)
+    ct(220, "< 4x4      8x8 >")
+    update()
+
+clear()
+textFont(FONT_ROBOTO_16)
+ct(110, "TOF startet ~10 s")
+update()
+TOF.init()
+TOF.set8x8()
+resetCount()
+
+def onDraw():
+    b = getButtons()
+    if b.left and lastL == false and n != 4:
+        TOF.set4x4()
+        n = 4
+        resetCount()
+    if b.right and lastR == false and n != 8:
+        TOF.set8x8()
+        n = 8
+        resetCount()
+    lastL = b.left
+    lastR = b.right
+
+    t0:long = millis()
+    TOF.getData()
+    t1:long = millis()
+    getSum = getSum + (t1 - t0)
+    loops = loops + 1
+
+    chk:long = 0
+    for i in n * n:
+        chk = chk + TOF.data[i] * (i + 1)
+    if chk != prevChk:
+        changes = changes + 1
+        prevChk = chk
+
+    if t1 - lastSec >= 1000:
+        loopsHz = loops
+        changesHz = changes
+        getAvg = getSum / loops
+        resetCount()
+        show()
+
+    if b.middle:
+        if returnToMenu():
+            return

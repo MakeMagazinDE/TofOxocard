@@ -1,0 +1,142 @@
+# ToF-Tiefenbild: rohe Messwerte als Farbraster (NanoPy)
+# links = 4x4, rechts = 8x8, hoch/runter = Farbbereich, Mitte = beenden
+
+import tof
+
+const ROTATE = 1       # Ausrichtung wie in der Gestensteuerung
+const MIRRORX = 1
+const MIRRORY = 0
+
+ranges:int[4] = [300, 600, 1200, 4000]   # Farbbereich in mm
+rangeIdx = 1
+n = 8                  # 8 = 8x8, 4 = 4x4
+frames = 0
+hz = 0
+prevChk:long
+lastSec:long
+lastL = false
+lastR = false
+lastU = false
+lastD = false
+colR:int
+colG:int
+colB:int
+txt:byte[24]
+
+# ---------- Farbe: nah = rot, mittel = grün, fern = blau ----------
+def setColor(d:int, rng:int):
+    t = 1.0 * d / rng
+    if t > 1.0:
+        t = 1.0
+    colR = 255.0 * (1.0 - t)
+    colB = 255.0 * t
+    g = 2.0 * t - 1.0
+    if g < 0.0:
+        g = 0.0 - g
+    colG = 255.0 * (1.0 - g)
+
+# ---------- Zone -> Feld auf dem Display (Linse dreht das Bild) ----------
+def cellOf(i:int)->int:
+    c0 = i % n
+    r0 = i / n
+    c = c0
+    r = r0
+    if ROTATE == 1:
+        c = n - 1 - r0
+        r = c0
+    if ROTATE == 2:
+        c = n - 1 - c0
+        r = n - 1 - r0
+    if ROTATE == 3:
+        c = r0
+        r = n - 1 - c0
+    if MIRRORX == 1:
+        c = n - 1 - c
+    if MIRRORY == 1:
+        r = n - 1 - r
+    return r * n + c
+
+# ---------- Rate: zählt, wie oft sich die Messwerte ändern ----------
+def trackRate(now:long):
+    chk:long = 0
+    for i in n * n:
+        chk = chk + TOF.data[i] * (i + 1)
+    if chk != prevChk:
+        frames = frames + 1
+        prevChk = chk
+    if now - lastSec >= 1000:
+        hz = frames
+        frames = 0
+        lastSec = now
+
+# ---------- Anzeige ----------
+def drawHeader():
+    stroke(255, 255, 255)
+    drawText(8, 6, "" + n + "x" + n)
+    txt = "" + hz + " Hz"
+    w = textWidth(txt)
+    drawText(120 - w / 2, 6, txt)
+    txt = "0-" + ranges[rangeIdx] / 10 + " cm"
+    w = textWidth(txt)
+    drawText(232 - w, 6, txt)
+
+def drawGrid():
+    cs = 200 / n
+    rng = ranges[rangeIdx]
+    for i in n * n:
+        cell = cellOf(i)
+        x = 20 + (cell % n) * cs
+        y = 32 + (cell / n) * cs
+        st = TOF.status[i]
+        valid = st == 5 or st == 9
+        noStroke()
+        if valid:
+            setColor(TOF.data[i], rng)
+            fill(colR, colG, colB)
+        else:
+            fill(40, 40, 50)
+        drawRectangle(x, y, cs - 2, cs - 2)
+        if n == 4 and valid:           # bei 4x4 passt der Wert ins Feld
+            stroke(0, 0, 0)
+            txt = "" + TOF.data[i] / 10
+            w = textWidth(txt)
+            drawText(x + (cs - 2) / 2 - w / 2, y + cs / 2 - 10, txt)
+
+# ---------- Start ----------
+clear()
+textFont(FONT_ROBOTO_24)
+w0 = textWidth("TOF startet ~10 s")
+drawText(120 - w0 / 2, 108, "TOF startet ~10 s")
+update()
+TOF.init()
+TOF.set8x8()
+textFont(FONT_ROBOTO_16)
+lastSec = millis()
+
+def onDraw():
+    b = getButtons()
+    if b.left and lastL == false and n != 4:
+        TOF.set4x4()
+        n = 4
+    if b.right and lastR == false and n != 8:
+        TOF.set8x8()
+        n = 8
+    if b.up and lastU == false and rangeIdx > 0:
+        rangeIdx = rangeIdx - 1
+    if b.down and lastD == false and rangeIdx < 3:
+        rangeIdx = rangeIdx + 1
+    lastL = b.left
+    lastR = b.right
+    lastU = b.up
+    lastD = b.down
+
+    TOF.getData()
+    trackRate(millis())
+    background(0, 0, 0)
+    drawHeader()
+    drawGrid()
+    update()
+
+    if b.middle:
+        if returnToMenu():
+            return
